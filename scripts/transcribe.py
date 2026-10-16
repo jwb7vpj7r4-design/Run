@@ -1,13 +1,13 @@
-"""Word-level transcription with faster-whisper.
+"""Word-level transcription with Whisper (openai-whisper).
 
     TOKENIZERS_PARALLELISM=false PYTHONUTF8=1 PY scripts/transcribe.py voice.mp3 \
         --model small --language en --prompt "Claude Code, HyperFrames"
 
-PY is the virtualenv's Python (.venv/bin/python, or .venv\\Scripts\\python on Windows).
+PY is the edit-tools Python: ~/.local/edit-tools/.venv/bin/python
 
 Writes transcript.json: every word with its start and end time, in seconds. The
-first run downloads the model from Hugging Face (small is about 460 MB); later
-runs load it from the local cache and work offline.
+first run downloads the model once (small is about 460 MB, into ~/.cache/whisper);
+later runs load it from there and work offline.
 
   --language  language of the voice; leave it out to auto-detect
   --prompt    names and brand words that appear in the video
@@ -23,26 +23,20 @@ import argparse
 import json
 import os
 import sys
+import urllib.error
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-from faster_whisper import WhisperModel  # noqa: E402
-from faster_whisper.utils import download_model  # noqa: E402
-from huggingface_hub.errors import LocalEntryNotFoundError  # noqa: E402
+import whisper  # noqa: E402
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 
 
-def model_path(name):
+def load_model(name):
     try:
-        return download_model(name, local_files_only=True)
-    except LocalEntryNotFoundError:
-        pass
-    print(f"Downloading the {name} model (first run only)...", file=sys.stderr)
-    try:
-        return download_model(name)
-    except Exception as e:
-        sys.exit(f"Could not download the {name} model from Hugging Face: {type(e).__name__}: {e}")
+        return whisper.load_model(name)
+    except urllib.error.URLError as e:
+        sys.exit(f"Could not download the {name} model (from openaipublic.azureedge.net): {e.reason}")
 
 
 def main():
@@ -57,26 +51,29 @@ def main():
     if not os.path.isfile(args.audio):
         sys.exit(f"No such file: {args.audio}")
 
-    model = WhisperModel(model_path(args.model), device="cpu", compute_type="int8")
-    segments, info = model.transcribe(
-        args.audio,
+    audio = whisper.load_audio(args.audio)
+    model = load_model(args.model)
+    result = model.transcribe(
+        audio,
         language=args.language,
         initial_prompt=args.prompt,
         word_timestamps=True,
+        fp16=model.device.type == "cuda",
     )
 
     words = []
-    for seg in segments:
-        print(f"[{seg.start:7.2f} -> {seg.end:7.2f}] {seg.text.strip()}", file=sys.stderr)
-        for w in seg.words or []:
-            text = w.word.strip()
+    for seg in result["segments"]:
+        print(f"[{seg['start']:7.2f} -> {seg['end']:7.2f}] {seg['text'].strip()}", file=sys.stderr)
+        for w in seg.get("words", []):
+            text = w["word"].strip()
             if text:
-                words.append({"id": f"w{len(words)}", "text": text, "start": round(w.start, 3), "end": round(w.end, 3)})
+                words.append({"id": f"w{len(words)}", "text": text, "start": round(w["start"], 3), "end": round(w["end"], 3)})
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(words, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    print(f"Wrote {len(words)} words to {args.output} (language: {info.language}, {info.duration:.1f}s)")
+    duration = len(audio) / whisper.audio.SAMPLE_RATE
+    print(f"Wrote {len(words)} words to {args.output} (language: {result['language']}, {duration:.1f}s)")
 
 
 if __name__ == "__main__":
